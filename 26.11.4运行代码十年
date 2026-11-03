@@ -1,0 +1,304 @@
+import pandas as pd
+import numpy as np
+from scipy.spatial import KDTree
+from tqdm import tqdm
+import os
+import glob
+
+# ---------- 配置项，请根据你的实际情况修改 ----------
+DATA_FOLDER = r'D:\芝加哥divvy bike数据集\2013-2026合集'  # 存放所有年份CSV的文件夹
+OUTPUT_CLEAN_FILE = 'all_years_trip_clean.csv'  # 清洗后的行程明细（可选）
+OUTPUT_DEMAND_FILE = 'all_years_demand_30min.csv'  # 最终30分钟需求表
+
+# 清洗阈值
+MIN_DURATION_SEC = 60  # 最短骑行1分钟
+MAX_DURATION_SEC = 4 * 3600  # 最长4小时
+MIN_SPEED_KMH = 0.5
+MAX_SPEED_KMH = 35
+LAT_MIN, LAT_MAX = 41.6, 42.1  # 芝加哥范围
+LNG_MIN, LNG_MAX = -87.9, -87.5
+STATION_MATCH_MAX_KM = 0.5  # 电动车站点匹配的最大距离（超过则生成虚拟站点）
+# ------------------------------------------------# 1.1 统一列名（兼容Divvy历年变化的列名）
+def standardize_columns(df):
+    """把不同年份的列名，映射到标准列名"""
+    rename_map = {
+        'trip_id': 'ride_id',
+        'bikeid': 'ride_id',
+        'bike_type': 'rideable_type',
+        'starttime': 'started_at',
+        'stoptime': 'ended_at',
+        'from_station_name': 'start_station_name',
+        'from_station_id': 'start_station_id',
+        'to_station_name': 'end_station_name',
+        'to_station_id': 'end_station_id',
+        'from_latitude': 'start_lat',
+        'start_latitude': 'start_lat',
+        'from_longitude': 'start_lng',
+        'start_longitude': 'start_lng',
+        'to_latitude': 'end_lat',
+        'end_latitude': 'end_lat',
+        'to_longitude': 'end_lng',
+        'end_longitude': 'end_lng',
+        'usertype': 'member_casual'
+    }
+    # 只重命名存在的列
+    rename_map = {k: v for k, v in rename_map.items() if k in df.columns}
+    df = df.rename(columns=rename_map)
+    return df
+
+# 1.2 计算距离
+def haversine(lat1, lng1, lat2, lng2):
+    """向量化计算大圆距离(公里)"""
+    R = 6371.0
+    lat1, lng1, lat2, lng2 = map(np.radians, [lat1, lng1, lat2, lng2])
+    dlat = lat2 - lat1
+    dlng = lng2 - lng1
+    a = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlng/2)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return R * c
+
+# 1.3 为电动车匹配终点站点
+def build_station_dict(df_list):
+    """
+    遍历所有年份的数据框，收集所有已知站点的ID和经纬度。
+    返回：site_tree (KDTree), site_df (包含station_id, lat, lng的DataFrame)
+    """
+    print("正在构建全局站点库...")
+    all_stations = []
+    for df in df_list:
+        # 有桩车：起点、终点
+        mask_classic = df['rideable_type'] == 'classic_bike'
+        if mask_classic.sum() == 0:
+            continue
+        tmp = df[mask_classic]
+
+        # 起点：仅当经纬度列都存在时才提取
+        if all(col in tmp.columns for col in ['start_station_id', 'start_lat', 'start_lng']):
+            s1 = tmp[['start_station_id', 'start_lat', 'start_lng']].dropna()
+            s1.columns = ['station_id', 'lat', 'lng']
+            all_stations.append(s1)
+
+        # 终点：仅当经纬度列都存在时才提取
+        if all(col in tmp.columns for col in ['end_station_id', 'end_lat', 'end_lng']):
+            s2 = tmp[['end_station_id', 'end_lat', 'end_lng']].dropna()
+            s2.columns = ['station_id', 'lat', 'lng']
+            all_stations.append(s2)
+
+        # 电动车起点站点也加入（虽然无桩，但起点站点是有效的）
+        mask_elec = df['rideable_type'] == 'electric_bike'
+        if mask_elec.sum() == 0:
+            continue
+        tmp2 = df[mask_elec]
+
+        # 电动车起点：仅当经纬度列都存在时才提取
+        if all(col in tmp2.columns for col in ['start_station_id', 'start_lat', 'start_lng']):
+            s3 = tmp2[['start_station_id', 'start_lat', 'start_lng']].dropna()
+            s3.columns = ['station_id', 'lat', 'lng']
+            all_stations.append(s3)
+
+    if not all_stations:
+        raise ValueError("没有找到任何有效的站点数据！")
+    stations = pd.concat(all_stations, ignore_index=True)
+    stations = stations.drop_duplicates(subset='station_id')
+    stations = stations.dropna(subset=['lat', 'lng'])
+    print(f"站点库构建完成，共 {len(stations)} 个唯一站点。")
+
+    # 构建 KDTree
+    coords_rad = np.deg2rad(stations[['lat', 'lng']].values)
+    tree = KDTree(coords_rad)
+    return tree, stations
+
+# 匹配函数
+def find_station_id(lat, lng, tree, stations_df, max_dist_km=0.5):
+    if pd.isna(lat) or pd.isna(lng):
+        return None
+    point_rad = np.deg2rad([lat, lng])
+    dist_rad, idx = tree.query(point_rad)
+    dist_km = dist_rad * 6371.0
+    if dist_km <= max_dist_km:
+        return stations_df.iloc[idx]['station_id']
+    else:
+        return f"V_{lat:.3f}_{lng:.3f}"
+# 找到所有CSV文件
+all_files = sorted(glob.glob(os.path.join(DATA_FOLDER, '*.csv')))
+print(f"找到 {len(all_files)} 个CSV文件")
+
+# 先读一遍所有文件，收集站点信息（只读需要的列，不进行清洗）
+dfs_for_stations = []
+for f in tqdm(all_files, desc="读取文件用于建立站点库"):
+    try:
+        df = pd.read_csv(f, low_memory=False)
+        df = standardize_columns(df)
+        if 'rideable_type' not in df.columns:
+            df['rideable_type'] = 'classic_bike'
+        # 只保留构建站点库需要的列
+        needed_cols = ['rideable_type', 'start_station_id', 'start_lat', 'start_lng',
+                       'end_station_id', 'end_lat', 'end_lng']
+        df = df[[c for c in needed_cols if c in df.columns]]
+        dfs_for_stations.append(df)
+    except Exception as e:
+        print(f"警告：读取 {f} 失败 ({e})，跳过")
+
+# 构建站点KD树
+station_tree, station_df = build_station_dict(dfs_for_stations)
+
+# 释放一些内存
+del dfs_for_stations
+temp_files = []  # 存放清洗后的临时文件路径
+
+for f in tqdm(all_files, desc="清洗每个文件"):
+    try:
+        df = pd.read_csv(f, low_memory=False)
+        df = standardize_columns(df)
+        if 'rideable_type' not in df.columns:
+            df['rideable_type'] = 'classic_bike'
+
+        # ---------- 基本清洗 ----------
+        # 删除关键字段缺失的行
+        essential_cols = ['started_at', 'ended_at', 'start_lat', 'start_lng',
+                          'end_lat', 'end_lng', 'rideable_type']
+        df = df.dropna(subset=[c for c in essential_cols if c in df.columns])
+
+        # 时间转换
+        df['started_at'] = pd.to_datetime(df['started_at'], errors='coerce')
+        df['ended_at'] = pd.to_datetime(df['ended_at'], errors='coerce')
+        df = df.dropna(subset=['started_at', 'ended_at'])
+
+        # 时长过滤
+        df['duration_sec'] = (df['ended_at'] - df['started_at']).dt.total_seconds()
+        df = df[(df['duration_sec'] >= MIN_DURATION_SEC) &
+                (df['duration_sec'] <= MAX_DURATION_SEC)]
+
+        # 空间过滤（仅当经纬度列存在时执行）
+        if all(col in df.columns for col in ['start_lat', 'start_lng', 'end_lat', 'end_lng']):
+            df = df[(df['start_lat'].between(LAT_MIN, LAT_MAX)) &
+                    (df['start_lng'].between(LNG_MIN, LNG_MAX)) &
+                    (df['end_lat'].between(LAT_MIN, LAT_MAX)) &
+                    (df['end_lng'].between(LNG_MIN, LNG_MAX))]
+            df = df[~((df['start_lat'] == 0) | (df['start_lng'] == 0) |
+                      (df['end_lat'] == 0) | (df['end_lng'] == 0))]
+
+            # 速度计算（仅当经纬度存在时计算）
+            df['distance_km'] = haversine(df['start_lat'], df['start_lng'],
+                                          df['end_lat'], df['end_lng'])
+            df['speed_kmh'] = df['distance_km'] / (df['duration_sec'] / 3600)
+            df = df[(df['speed_kmh'] >= MIN_SPEED_KMH) &
+                    (df['speed_kmh'] <= MAX_SPEED_KMH)]
+        else:
+            # 无经纬度的早期数据，跳过距离/速度过滤
+            df['distance_km'] = np.nan
+            df['speed_kmh'] = np.nan
+
+        # ---------- 分车型处理 ----------
+        # 经典车：站点ID非空，转字符串
+        mask_c = df['rideable_type'] == 'classic_bike'
+        df_c = df[mask_c].copy()
+        if len(df_c) > 0:
+            df_c = df_c.dropna(subset=['start_station_id', 'end_station_id'])
+            df_c['start_station_id'] = df_c['start_station_id'].astype(int).astype(str)
+            df_c['end_station_id'] = df_c['end_station_id'].astype(int).astype(str)
+
+        # 电动车：终点站点用KDTree匹配
+        mask_e = df['rideable_type'] == 'electric_bike'
+        df_e = df[mask_e].copy()
+        if len(df_e) > 0:
+            # 起点站点ID转字符串
+            df_e['start_station_id'] = df_e['start_station_id'].astype(int).astype(str)
+            # 终点站点匹配
+            df_e['end_station_id'] = df_e.apply(
+                lambda row: find_station_id(row['end_lat'], row['end_lng'],
+                                            station_tree, station_df, STATION_MATCH_MAX_KM),
+                axis=1
+            )
+            # 如果起点站点缺失，也尝试匹配（对于极少数起点无站点ID的电动车）
+            no_start = df_e['start_station_id'].isna() | (df_e['start_station_id'] == '')
+            if no_start.sum() > 0:
+                df_e.loc[no_start, 'start_station_id'] = df_e.loc[no_start].apply(
+                    lambda row: find_station_id(row['start_lat'], row['start_lng'],
+                                                station_tree, station_df, STATION_MATCH_MAX_KM),
+                    axis=1
+                )
+            df_e = df_e.dropna(subset=['start_station_id', 'end_station_id'])
+
+        # 合并并保存
+        if len(df_c) > 0 or len(df_e) > 0:
+            df_clean = pd.concat([df_c, df_e], ignore_index=True)
+            # 只保留最终需要的列
+            final_cols = ['ride_id', 'rideable_type', 'started_at', 'ended_at',
+                          'start_station_id', 'end_station_id', 'duration_sec', 'distance_km']
+            df_clean = df_clean[[c for c in final_cols if c in df_clean.columns]]
+            temp_file = f"temp_clean_{os.path.basename(f)}"
+            df_clean.to_csv(temp_file, index=False)
+            temp_files.append(temp_file)
+
+    except Exception as e:
+        print(f"处理文件 {f} 时出错：{e}，跳过")
+
+print(f"清洗完成，共生成 {len(temp_files)} 个临时文件。")
+# 用于存放聚合结果的字典
+# key: (station_id, time_bin, rideable_type)
+# value: [pickups, dropoffs]
+from collections import defaultdict
+
+demand_dict = defaultdict(lambda: [0, 0])  # [pickups, dropoffs]
+
+for temp_f in tqdm(temp_files, desc="合并并聚合"):
+    df = pd.read_csv(temp_f)
+    if len(df) == 0:
+        continue
+
+    # 解析时间
+    df['started_at'] = pd.to_datetime(df['started_at'])
+    df['ended_at'] = pd.to_datetime(df['ended_at'])
+
+    # 30分钟窗口floor
+    df['time_bin'] = df['started_at'].dt.floor('30min')
+    df['time_bin_end'] = df['ended_at'].dt.floor('30min')
+
+    # 借车量
+    pickups = df.groupby(['start_station_id', 'time_bin', 'rideable_type']).size()
+    for (station, tb, rtype), count in pickups.items():
+        demand_dict[(station, tb, rtype)][0] += count
+
+    # 还车量
+    dropoffs = df.groupby(['end_station_id', 'time_bin_end', 'rideable_type']).size()
+    for (station, tb, rtype), count in dropoffs.items():
+        demand_dict[(station, tb, rtype)][1] += count
+
+# 转换成DataFrame
+rows = []
+for (station, time_bin, rtype), (p, d) in demand_dict.items():
+    rows.append({
+        'station_id': station,
+        'time_bin': time_bin,
+        'rideable_type': rtype,
+        'pickups': p,
+        'dropoffs': d
+    })
+
+demand_table = pd.DataFrame(rows)
+demand_table = demand_table.sort_values(['time_bin', 'station_id', 'rideable_type'])
+print(f"最终需求表行数：{len(demand_table)}")
+
+# 保存
+demand_table.to_csv(OUTPUT_DEMAND_FILE, index=False)
+print(f"30分钟需求表已保存至 {OUTPUT_DEMAND_FILE}")
+
+# 可选：把所有清洗后的行程明细合并并保存（若内存足够）
+# 如果不需明细，可以跳过；或者合并到一个文件
+if OUTPUT_CLEAN_FILE:
+    all_clean = []
+    for temp_f in temp_files:
+        df = pd.read_csv(temp_f)
+        all_clean.append(df)
+    df_clean_all = pd.concat(all_clean, ignore_index=True)
+    df_clean_all.to_csv(OUTPUT_CLEAN_FILE, index=False)
+    print(f"清洗后行程数据已保存至 {OUTPUT_CLEAN_FILE}")
+    import os
+
+    for temp_f in temp_files:
+        try:
+            os.remove(temp_f)
+        except:
+            pass
+    print("临时文件已清理。")
