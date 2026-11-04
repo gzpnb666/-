@@ -4,11 +4,6 @@
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
-import time
-
-for i in tqdm(range(10)):
-    time.sleep(0.1)
-
 
 # ========== 1. 读取现有需求表 ==========
 print("正在读取需求表...")
@@ -21,78 +16,92 @@ print(f"原始站点数量: {demand['station_id'].nunique()}")
 
 # ========== 2. 确定时间范围（与清洗脚本对齐：2020年7月后混合运营期） ==========
 time_start = '2020-07-01 00:00:00'
-time_end   = '2023-12-31 23:30:00'
-all_times  = pd.date_range(time_start, time_end, freq='30min')
+time_end = '2023-12-31 23:30:00'
+all_times = pd.date_range(time_start, time_end, freq='30min')
 print(f"时间步总数: {len(all_times)}")
 
 # ========== 3. 过滤虚拟站点，仅保留真实物理站点 ==========
 stations = demand['station_id'].unique()
-# 统计虚拟站点数量
 virtual_stations = [s for s in stations if str(s).startswith('V_')]
 print(f"原始站点总数: {len(stations)}")
 print(f"其中虚拟站点(V_)数量: {len(virtual_stations)}")
 
-# 过滤：剔除虚拟站点，只保留真实站点用于后续预测分析
 real_stations = [s for s in stations if not str(s).startswith('V_')]
 demand = demand[demand['station_id'].isin(real_stations)]
+# 同时过滤时间范围，只保留目标时段内的数据
+demand = demand[(demand['time_bin'] >= time_start) & (demand['time_bin'] <= time_end)]
 stations = demand['station_id'].unique()
 print(f"过滤后真实站点数量: {len(stations)}")
+print(f"过滤后有效数据行数: {len(demand)}")
 
-# ========== 4. 构建完整索引 ==========
-print("正在构建完整索引...")
-index_full = pd.MultiIndex.from_product(
-    [stations, all_times, ['classic_bike', 'electric_bike']],
-    names=['station_id', 'time_bin', 'rideable_type']
-)
-df_full = pd.DataFrame(index=index_full).reset_index()
-print(f"完整索引行数: {len(df_full)}")
-
-# ========== 5. 左连接并填充0 ==========
-print("正在合并数据...")
-df_full = df_full.merge(
-    demand,
-    on=['station_id', 'time_bin', 'rideable_type'],
-    how='left'
-)
-df_full['pickups']  = df_full['pickups'].fillna(0).astype(np.int32)
-df_full['dropoffs'] = df_full['dropoffs'].fillna(0).astype(np.int32)
-print(f"补全后行数: {len(df_full)}")
-print(f"非零记录占比: {(df_full['pickups'] > 0).mean()*100:.1f}%")
-print(df_full.head(5))
-
-# ========== 6. 保存为 CSV（保留做分析用） ==========
-print("正在保存CSV...")
-df_full.to_csv('demand_full_30min.csv', index=False)
-print("已保存 demand_full_30min.csv")
-
-# ========== 7. 转成 .npy 张量（预测模型用，矢量化极速填充） ==========
+# ========== 4. 直接构建张量（跳过5亿行超大表格，内存占用降低95%） ==========
 print("正在构建张量...")
 N_stations = len(stations)
-N_time     = len(all_times)
+N_time = len(all_times)
 tensor = np.zeros((N_stations, N_time, 2, 2), dtype=np.float32)
 
 # 建立映射字典
 station_to_idx = {str(s): i for i, s in enumerate(stations)}
 time_to_idx = {tb: i for i, tb in enumerate(all_times)}
 
-# 批量计算索引，避免逐行循环
-df_full['sid'] = df_full['station_id'].astype(str).map(station_to_idx)
-df_full['tid'] = df_full['time_bin'].map(time_to_idx)
-df_full['vid'] = df_full['rideable_type'].map({'classic_bike': 0, 'electric_bike': 1})
+# 批量计算每条数据对应的张量坐标
+demand['sid'] = demand['station_id'].astype(str).map(station_to_idx)
+demand['tid'] = demand['time_bin'].map(time_to_idx)
+demand['vid'] = demand['rideable_type'].map({'classic_bike': 0, 'electric_bike': 1})
 
-# 矢量化批量填充（替代逐行遍历，速度提升百倍）
-sid_arr = df_full['sid'].values
-tid_arr = df_full['tid'].values
-vid_arr = df_full['vid'].values
-tensor[sid_arr, tid_arr, vid_arr, 0] = df_full['pickups'].values
-tensor[sid_arr, tid_arr, vid_arr, 1] = df_full['dropoffs'].values
+# 过滤掉时间范围外、站点不存在的无效行
+demand = demand.dropna(subset=['sid', 'tid', 'vid'])
+demand['sid'] = demand['sid'].astype(int)
+demand['tid'] = demand['tid'].astype(int)
+demand['vid'] = demand['vid'].astype(int)
+
+# 矢量化批量填充张量（核心优化，几秒完成）
+sid_arr = demand['sid'].values
+tid_arr = demand['tid'].values
+vid_arr = demand['vid'].values
+tensor[sid_arr, tid_arr, vid_arr, 0] = demand['pickups'].values
+tensor[sid_arr, tid_arr, vid_arr, 1] = demand['dropoffs'].values
 
 print(f"张量形状: {tensor.shape}  (站点数={N_stations}, 时间步={N_time}, 车型=2, 指标=2)")
-print(f"张量大小: {tensor.nbytes / 1024**2:.1f} MB")
+print(f"张量大小: {tensor.nbytes / 1024 ** 2:.1f} MB")
 
 # 保存张量与辅助文件
 np.save('demand_tensor.npy', tensor)
 np.save('stations.npy', stations)
 np.save('time_bins.npy', all_times)
 print("已保存 demand_tensor.npy, stations.npy, time_bins.npy")
-print("数据补全与张量构建完成！")
+
+# ========== 5. 可选：分批生成补零后的CSV（不需要可以注释掉） ==========
+# 如果你需要 demand_full_30min.csv 做统计分析，开启下面的代码
+# 采用分站点逐批写入，不会爆内存，但会慢一些
+print("正在分批生成补零CSV...")
+csv_path = 'demand_full_30min.csv'
+# 先写表头
+pd.DataFrame(columns=['station_id', 'time_bin', 'rideable_type', 'pickups', 'dropoffs']).to_csv(csv_path, index=False)
+
+for station in tqdm(stations, desc="逐站点写入CSV"):
+    # 取出单个站点的数据
+    station_data = demand[demand['station_id'] == station]
+    # 构建该站点的完整时间×车型索引
+    station_idx = pd.MultiIndex.from_product(
+        [all_times, ['classic_bike', 'electric_bike']],
+        names=['time_bin', 'rideable_type']
+    )
+    station_full = pd.DataFrame(index=station_idx).reset_index()
+    station_full['station_id'] = station
+
+    # 合并数据并补零
+    station_full = station_full.merge(
+        station_data[['time_bin', 'rideable_type', 'pickups', 'dropoffs']],
+        on=['time_bin', 'rideable_type'],
+        how='left'
+    )
+    station_full['pickups'] = station_full['pickups'].fillna(0).astype(np.int32)
+    station_full['dropoffs'] = station_full['dropoffs'].fillna(0).astype(np.int32)
+
+    # 调整列顺序并追加写入
+    station_full = station_full[['station_id', 'time_bin', 'rideable_type', 'pickups', 'dropoffs']]
+    station_full.to_csv(csv_path, mode='a', header=False, index=False)
+
+print("已保存 demand_full_30min.csv")
+print("全部处理完成！")
