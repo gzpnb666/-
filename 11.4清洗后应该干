@@ -1,0 +1,268 @@
+好的，用户现在直接要求我告诉他一步步如何操作，非常具体。结合之前的对话，我已经了解了他的论文框架、数据清洗代码和输出，以及他的调度模型构想。他的深层需求不仅仅是知道“做什么”，而是需要一个极其详细、可执行、从零开始的代码和实验操作手册，能让他直接照着做，避免卡在任何一步。
+
+我需要把之前所有建议整合成一个连贯的、按时间顺序的“操作流水线”。核心是围绕他的笔记本配置（很强）和数据现状（已有清洗后需求表）来设计。
+
+首先，我要确定一个清晰的起点。他现在的数据是 all_years_demand_30min.csv，但这个表是不完整的。所以第一步，也是最关键的一步，就是补全时间序列，生成一个完整的、无缺失的时空矩阵。这是后续所有分析和模型的基础。我会提供具体的Python代码，说明如何生成完整的多索引并填充0，最后保存成一个可以用来做分析和建模的干净文件。
+
+接着，这个文件会非常大（1320个站点 * 多年数据），不适合直接全部用来做后续分析。我需要引导他先从这个全量数据中切出一部分，专门用于第3章的时空特征分析。比如选择一年的数据或者几个代表性时段，这样生成的图表才会清晰，分析周期也短。我会告诉他可以按周聚合、按小时聚合来画图，观察分车型的差异。
+
+做完分析后，就要准备第4章预测模型的数据了。这里的关键是站点剪枝，不能直接上1320个站点训练模型。我需要给出一个明确的筛选标准，比如只保留总需求前300个站点。然后，我才能教他如何构建图（邻接矩阵）、如何将数据组织成模型需要的三维张量格式（站点数, 时间步长, 特征数），并进行标准化和训练/验证/测试集的时序划分。最后保存好处理好的训练数据。
+
+第5章的调度模型是另一个难点。考虑到MILP的复杂性，必须从小规模算例开始。我需要指导他如何从300个站点中挑选出最具代表性的20个站点，如何构建调度模型所需的距离、库存、容量等参数，以及如何用第4章（或简化版）的预测输出作为调度模型的需求输入。这样他就能在一个可控的环境下先跑通模型和算法。
+
+整个回答的结构会是一个清晰的分阶段操作指南，每个阶段都有明确的目标、输入、输出和具体代码片段。我会用“第一阶段”、“第二阶段”这样的方式来组织，让操作路径一目了然。最后还可以做一个总结，告诉他按这个流程走，笔记本的算力完全够用，他能顺利推进论文。从现在开始，我不再讲“思路”和“方向”，只给你能直接点运行的下一步操作。按我下面这套流程走，你的论文可以一阶段一阶段地推进。
+
+第一阶段：补全完整时空矩阵（现在立刻做）
+
+目标
+把 all_years_demand_30min.csv 补成无缺失的 .npy 张量文件，供后续所有分析和模型使用。
+
+具体操作（新建一个脚本 step1_build_tensor.py，复制即用）
+
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+========== 1. 读取现有需求表 ==========
+demand = pd.read_csv('all_years_demand_30min.csv')
+demand'time_bin'] = pd.to_datetime(demand['time_bin'])
+
+========== 2. 确定时间范围（选2020-05之后，混合运营） ==========
+time_start = '2020-05-01 00:00:00'
+time_end   = '2023-12-31 23:30:00'
+all_times  = pd.date_range(time_start, time_end, freq='30min')
+print(f"时间步总数: {len(all_times)}")
+
+========== 3. 拿到所有站点 ==========
+stations = demand['station_id'].unique()
+print(f"站点总数: {len(stations)}")
+
+========== 4. 构建完整索引 ==========
+index_full = pd.MultiIndex.from_product(
+    [stations, all_times, ['classic_bike', 'electric_bike']],
+    names=['station_id', 'time_bin', 'rideable_type']
+)
+df_full = pd.DataFrame(index=index_full).reset_index()
+
+========== 5. 左连接并填充0 ==========
+df_full = df_full.merge(
+    demand,
+    on=['station_id', 'time_bin', 'rideable_type'],
+    how='left'
+)
+df_full['pickups']  = df_full['pickups'].fillna(0).astype(int)
+df_full['dropoffs'] = df_full['dropoffs'].fillna(0).astype(int)
+
+print(f"补全后行数: {len(df_full)}")
+print(df_full.head(5))
+
+========== 6. 保存为 CSV（保留一份，做分析用） ==========
+df_full.to_csv('demand_full_30min.csv', index=False)
+
+========== 7. 转成 .npy 张量（预测模型用） ==========
+维度：(站点, 时间步, 2种车型, 2个指标)
+N_stations = len(stations)
+N_time     = len(all_times)
+tensor = np.zeros((N_stations, N_time, 2, 2), dtype=np.float32)
+
+建立 station_id -> 行号 的映射
+station_to_idx = {s: i for i, s in enumerate(stations)}
+
+for _, row in tqdm(df_full.iterrows(), total=len(df_full)):
+    i = station_to_idx[row['station_id']]
+    t = np.where(all_times == row['time_bin'])[0
+    v = 0 if row['rideable_type'] == 'classic_bike' else 1  # 0=自行车, 1=电动车
+    tensor[i, t, v, 0] = row['pickups']
+    tensor[i, t, v, 1] = row['dropoffs']
+
+print(f"张量形状: {tensor.shape}  (站点数={N_stations}, 时间步={N_time}, 车型=2, 指标=2)")
+
+保存张量
+np.save('demand_tensor.npy', tensor)
+同时保存辅助映射
+np.save('stations.npy', stations)
+np.save('time_bins.npy', all_times)
+print("已保存 demand_tensor.npy, stations.npy, time_bins.npy")
+
+运行完之后你得到 4 个文件：demand_tensor.npy，stations.npy，time_bins.npy，demand_full_30min.csv。
+
+第二阶段：第3章时空特征分析（1小时内出图）
+
+目标
+生成论文第3章需要的所有可视化图表，不用动代码。
+
+具体操作（新建脚本 step2_eda_plots.py）
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+加载补全后的数据
+df = pd.read_csv('demand_full_30min.csv', parse_dates=['time_bin'])
+
+提取小时和星期
+df['hour']      = df['time_bin'].dt.hour
+df['weekday']   = df['time_bin'].dt.dayofweek  # 0=周一
+df['is_weekend'] = df['weekday'].isin([5,6])
+
+========= 1. 分车型小时平均需求（工作日 vs 周末） =========
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for ax, weekend_flag, title in zip(axes, [False, True], ['工作日', '周末']):
+    mask = (df['is_weekend'] == weekend_flag)
+    for rtype, label, color in [('classic_bike','经典单车','#1f77b4'),
+                                  ('electric_bike','电动车','#ff7f0e')]:
+        tmp = df[mask & (df['rideable_type']==rtype)].groupby('hour')['pickups'].mean()
+        ax.plot(tmp.index, tmp.values, label=label, color=color, linewidth=2)
+    ax.set_title(f'{title} 各时段平均借车量')
+    ax.set_xlabel('小时'), ax.set_xlim(0,23)
+    ax.legend(), ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('fig_hourly_pattern.png', dpi=200); plt.show()
+
+========= 2. 各站点净流量（借-还）空间分布 =========
+需要站点经纬度，从你之前的 station_df 再跑一次即可
+stations_df = pd.read_csv('stations_lat_lng.csv')  # 自己把 station_df 先保存一下
+如果你还没有，可以在上一个脚本里加上 station_df.to_csv('stations_lat_lng.csv')
+
+net_flow = df.groupby(['station_id','rideable_type'])[['pickups','dropoffs']].sum()
+net_flow['net'] = net_flow['pickups'] - net_flow['dropoffs']
+net_flow = net_flow.reset_index()
+
+pivot = net_flow.pivot_table(index='station_id', columns='rideable_type', values='net').fillna(0)
+pivot.to_csv('station_net_flow.csv')
+print("站净流量已保存，可以用QGIS/Carto/Kepler.gl 画地图")
+这里只输出一个简单的散点图示意
+（实际论文建议用 Kepler.gl 交互地图，代码略）
+
+EDA分析完了，第3章图表素材就齐了。
+
+第三阶段：为第4章预测准备训练数据
+
+目标
+从步骤一的张量中提取特征，构建 PyTorch 可用的 DataLoader。
+
+具体操作（新建 step3_prepare_prediction_data.py）
+
+核心要点： 站点太多会影响训练速度，先只取总需求前300个站点。
+
+import numpy as np
+import pandas as pd
+
+tensor    = np.load('demand_tensor.npy')   # (N, T, 2, 2)
+stations  = np.load('stations.npy', allow_pickle=True)
+time_bins = np.load('time_bins.npy', allow_pickle=True)
+
+========== 1. 按总需求排序，取前 K 个站点 ==========
+total_demand = tensor.sum(axis=(1,2,3))   # 每个站点的总借还量
+top_k = 300
+top_ids = np.argsort(total_demand)[-top_k:]
+tensor_filtered = tensor[top_ids]          # (300, T, 2, 2)
+stations_filtered = stations[top_ids]
+print(f"保留 {top_k} 个站点")
+
+========== 2. 构建特征和目标 ==========
+通道设计：0,1 -> 自行车借/还；2,3 -> 电动车借/还
+features = np.concatenate([tensor_filtered[:,:,0,:], tensor_filtered[:,:,1,:]], axis=-1)
+形状: (300, T, 4)
+
+========== 3. 标准化（过每个站点） ==========
+mean = features.mean(axis=(1,2), keepdims=True)
+std  = features.std(axis=(1,2), keepdims=True) + 1e-5
+features_norm = (features - mean) / std
+
+========== 4. 时间滑动窗口 ==========
+def create_sequences(data, input_len=12, output_len=1):
+    """返回 X: (样本数, 站点, 输入步, 特征), Y: (样本数, 站点, 输出步, 特征)"""
+    X, Y = [], []
+    for t in range(data.shape[1] - input_len - output_len + 1):
+        X.append(data[:, t:t+input_len, :])
+        Y.append(data[:, t+input_len:t+input_len+output_len, :])
+    return np.array(X), np.array(Y)
+
+X_all, Y_all = create_sequences(features_norm, input_len=12, output_len=1)
+print(f"输入形状: {X_all.shape}, 目标形状: {Y_all.shape}")
+
+========== 5. 时序切分（避免泄露） ==========
+T_total = X_all.shape[0]
+train_end = int(T_total * 0.7)
+val_end   = int(T_total * 0.85)
+
+X_train, Y_train = X_all[:train_end], Y_all[:train_end]
+X_val,   Y_val   = X_all[train_end:val_end], Y_all[train_end:val_end]
+X_test,  Y_test  = X_all[val_end:], Y_all[val_end:]
+print(f"训练集: {X_train.shape}, 验证集: {X_val.shape}, 测试集: {X_test.shape}")
+
+保存
+np.savez('pred_data.npz',
+         X_train=X_train, Y_train=Y_train,
+         X_val=X_val, Y_val=Y_val,
+         X_test=X_test, Y_test=Y_test,
+         mean=mean, std=std,
+         stations=stations_filtered)
+print("预测数据已保存至 pred_data.npz")
+
+第四阶段：第4章双分支 Graph WaveNet 建模
+
+目标
+搭一个能跑通、能输出的预测模型，再升级为概率预测。
+
+分步操作
+
+4.1 先跑一个确定性版本（1天内搭好框架）
+用 PyTorch 实现标准 Graph WaveNet（GitHub 有开源实现 nnzhan/Graph-WaveNet）。
+把网络改为双分支：共享第一层时空卷积，然后分两个分支输出 [自行车借、自行车还] 和 [电动车借、电动车还]。
+损失函数：Masked MAE（只计算有需求时段的误差，但你已经补零所以直接 MSE 即可）。
+训练器：简单写一个 train_epoch / validate 循环。
+输出：在训练过程中每 10 个 epoch 保存一次测试集的预测（解析回原空间）。
+
+4.2 升级为概率预测（改损失函数 + 输出头）
+把输出头从“直接预测值”改为“预测均值和对数方差”。
+损失函数：NLL_Loss = 0.5 * (np.log(2π) + log_var + (target - mean)² / exp(log_var))
+评估指标：MAE（均值准确度）+ CRPS（概率准确度）。
+实验对比表就出来了：WaveNet vs LSTM vs STGCN，分自行车和电动车汇报。
+
+第五阶段：第5章 MILP + Benders 分解（先小后大）
+
+目标
+按“20站点 → 50站点 → 更大”逐步验证算法。
+
+5.1 20站点算例生成
+
+import numpy as np
+import pandas as pd
+
+从 filtered 站点中再取前20个最忙站点
+stations = np.load('stations_filtered.npy', allow_pickle=True)  # 你之前保存的
+stations_20 = stations[:20]
+
+取预测数据的一个子段（比如某天高峰 6:00-10:00，对应8个时间步）
+tensor = np.load('demand_tensor.npy')
+这里你用自己预测模型的 test 部分的某一段，作为确定性需求输入
+假设你取某个工作日 16 个时间步（8小时）
+
+构造距离矩阵（用之前 station_df）
+coords = station_df[station_df['station_id'].isin(stations_20)]
+... 计算 20x20 距离矩阵，保存为 distance_matrix.npy
+
+5.2 用 Gurobi/Pyomo 写 MILP，执行标准 Benders 分解
+主问题（整数变量优化）用 Gurobi 直接求解。
+子问题（各站点库存平衡）对偶手法生成割平面。
+循环 10~50 次即可收敛。
+
+5.3 加入 ML 增强（第5.2.3节的内容）
+把 Benders 迭代中的“割+特征”存下来，训练一个二分类器（XGBoost/LightGBM）预测割是否活跃。
+把分类器嵌入求解循环，跳过预测不活跃的割。
+保存结果：速度提升表、gap图。
+
+第六阶段：第6章实验汇总
+
+预测表格：| 模型 | 自行车MAE | 电动车MAE | CRPS |
+Benders对比表：| 算法 | 20站点时间 | 50站点时间 | 100站点gap |
+消融表：去掉分车型约束、去掉ML增强，效果分别差多少。
+
+你此刻应该做的事（只做一件）
+
+先运行 第一阶段 的脚本。跑完之后把输出打印的第 1 行数据发给我，比如：
+补全后行数: 41553400
+张量形状: (1320, 65376, 2, 2)
+我就能确认数据流是否正确，然后你可以直接进入第二阶段，不用猜。这样做下去，每周都有可见的进展。
