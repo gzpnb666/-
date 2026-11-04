@@ -1,0 +1,174 @@
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+# ========== 1. 读取现有需求表 ==========
+demand = pd.read_csv('all_years_demand_30min.csv')
+demand['time_bin'] = pd.to_datetime(demand['time_bin'])
+
+# ========== 2. 确定时间范围（选2020-05之后，混合运营） ==========
+time_start = '2020-05-01 00:00:00'
+time_end   = '2023-12-31 23:30:00'
+all_times  = pd.date_range(time_start, time_end, freq='30min')
+print(f"时间步总数: {len(all_times)}")
+
+# ========== 3. 拿到所有站点 ==========
+stations = demand['station_id'].unique()
+print(f"站点总数: {len(stations)}")
+
+# ========== 4. 构建完整索引 ==========
+index_full = pd.MultiIndex.from_product(
+    [stations, all_times, ['classic_bike', 'electric_bike']],
+    names=['station_id', 'time_bin', 'rideable_type']
+)
+df_full = pd.DataFrame(index=index_full).reset_index()
+
+# ========== 5. 左连接并填充0 ==========
+df_full = df_full.merge(
+    demand,
+    on=['station_id', 'time_bin', 'rideable_type'],
+    how='left'
+)
+df_full['pickups']  = df_full['pickups'].fillna(0).astype(int)
+df_full['dropoffs'] = df_full['dropoffs'].fillna(0).astype(int)
+
+print(f"补全后行数: {len(df_full)}")
+print(df_full.head(5))
+
+# ========== 6. 保存为 CSV（保留一份，做分析用） ==========
+df_full.to_csv('demand_full_30min.csv', index=False)
+
+# ========== 7. 转成 .npy 张量（预测模型用） ==========
+# 维度：(站点, 时间步, 2种车型, 2个指标)
+N_stations = len(stations)
+N_time     = len(all_times)
+tensor = np.zeros((N_stations, N_time, 2, 2), dtype=np.float32)
+
+# 建立 station_id -> 行号 的映射
+station_to_idx = {s: i for i, s in enumerate(stations)}
+
+for _, row in tqdm(df_full.iterrows(), total=len(df_full)):
+    i = station_to_idx[row['station_id']]
+    t = np.where(all_times == row['time_bin'])[0][0]
+    v = 0 if row['rideable_type'] == 'classic_bike' else 1  # 0=自行车, 1=电动车
+    tensor[i, t, v, 0] = row['pickups']
+    tensor[i, t, v, 1] = row['dropoffs']
+
+print(f"张量形状: {tensor.shape}  (站点数={N_stations}, 时间步={N_time}, 车型=2, 指标=2)")
+
+# 保存张量
+np.save('demand_tensor.npy', tensor)
+# 同时保存辅助映射
+np.save('stations.npy', stations)
+np.save('time_bins.npy', all_times)
+print("已保存 demand_tensor.npy, stations.npy, time_bins.npy")
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# 加载补全后的数据
+df = pd.read_csv('demand_full_30min.csv', parse_dates=['time_bin'])
+
+# 提取小时和星期
+df['hour']      = df['time_bin'].dt.hour
+df['weekday']   = df['time_bin'].dt.dayofweek  # 0=周一
+df['is_weekend'] = df['weekday'].isin([5,6])
+
+# ========= 1. 分车型小时平均需求（工作日 vs 周末） =========
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+for ax, weekend_flag, title in zip(axes, [False, True], ['工作日', '周末']):
+    mask = (df['is_weekend'] == weekend_flag)
+    for rtype, label, color in [('classic_bike','经典单车','#1f77b4'),
+                                  ('electric_bike','电动车','#ff7f0e')]:
+        tmp = df[mask & (df['rideable_type']==rtype)].groupby('hour')['pickups'].mean()
+        ax.plot(tmp.index, tmp.values, label=label, color=color, linewidth=2)
+    ax.set_title(f'{title} 各时段平均借车量')
+    ax.set_xlabel('小时'), ax.set_xlim(0,23)
+    ax.legend(), ax.grid(alpha=0.3)
+plt.tight_layout(); plt.savefig('fig_hourly_pattern.png', dpi=200); plt.show()
+
+# ========= 2. 各站点净流量（借-还）空间分布 =========
+# 需要站点经纬度，从你之前的 station_df 再跑一次即可
+stations_df = pd.read_csv('stations_lat_lng.csv')  # 自己把 station_df 先保存一下
+# 如果你还没有，可以在上一个脚本里加上 station_df.to_csv('stations_lat_lng.csv')
+
+net_flow = df.groupby(['station_id','rideable_type'])[['pickups','dropoffs']].sum()
+net_flow['net'] = net_flow['pickups'] - net_flow['dropoffs']
+net_flow = net_flow.reset_index()
+
+pivot = net_flow.pivot_table(index='station_id', columns='rideable_type', values='net').fillna(0)
+pivot.to_csv('station_net_flow.csv')
+print("站净流量已保存，可以用QGIS/Carto/Kepler.gl 画地图")
+# 这里只输出一个简单的散点图示意
+# （实际论文建议用 Kepler.gl 交互地图，代码略）
+import numpy as np
+import pandas as pd
+
+tensor    = np.load('demand_tensor.npy')   # (N, T, 2, 2)
+stations  = np.load('stations.npy', allow_pickle=True)
+time_bins = np.load('time_bins.npy', allow_pickle=True)
+
+# ========== 1. 按总需求排序，取前 K 个站点 ==========
+total_demand = tensor.sum(axis=(1,2,3))   # 每个站点的总借还量
+top_k = 300
+top_ids = np.argsort(total_demand)[-top_k:]
+tensor_filtered = tensor[top_ids]          # (300, T, 2, 2)
+stations_filtered = stations[top_ids]
+print(f"保留 {top_k} 个站点")
+
+# ========== 2. 构建特征和目标 ==========
+# 通道设计：0,1 -> 自行车借/还；2,3 -> 电动车借/还
+features = np.concatenate([tensor_filtered[:,:,0,:], tensor_filtered[:,:,1,:]], axis=-1)
+# 形状: (300, T, 4)
+
+# ========== 3. 标准化（过每个站点） ==========
+mean = features.mean(axis=(1,2), keepdims=True)
+std  = features.std(axis=(1,2), keepdims=True) + 1e-5
+features_norm = (features - mean) / std
+
+# ========== 4. 时间滑动窗口 ==========
+def create_sequences(data, input_len=12, output_len=1):
+    """返回 X: (样本数, 站点, 输入步, 特征), Y: (样本数, 站点, 输出步, 特征)"""
+    X, Y = [], []
+    for t in range(data.shape[1] - input_len - output_len + 1):
+        X.append(data[:, t:t+input_len, :])
+        Y.append(data[:, t+input_len:t+input_len+output_len, :])
+    return np.array(X), np.array(Y)
+
+X_all, Y_all = create_sequences(features_norm, input_len=12, output_len=1)
+print(f"输入形状: {X_all.shape}, 目标形状: {Y_all.shape}")
+
+# ========== 5. 时序切分（避免泄露） ==========
+T_total = X_all.shape[0]
+train_end = int(T_total * 0.7)
+val_end   = int(T_total * 0.85)
+
+X_train, Y_train = X_all[:train_end], Y_all[:train_end]
+X_val,   Y_val   = X_all[train_end:val_end], Y_all[train_end:val_end]
+X_test,  Y_test  = X_all[val_end:], Y_all[val_end:]
+print(f"训练集: {X_train.shape}, 验证集: {X_val.shape}, 测试集: {X_test.shape}")
+
+# 保存
+np.savez('pred_data.npz',
+         X_train=X_train, Y_train=Y_train,
+         X_val=X_val, Y_val=Y_val,
+         X_test=X_test, Y_test=Y_test,
+         mean=mean, std=std,
+         stations=stations_filtered)
+print("预测数据已保存至 pred_data.npz")
+import numpy as np
+import pandas as pd
+
+# 从 filtered 站点中再取前20个最忙站点
+stations = np.load('stations_filtered.npy', allow_pickle=True)  # 你之前保存的
+stations_20 = stations[:20]
+
+# 取预测数据的一个子段（比如某天高峰 6:00-10:00，对应8个时间步）
+tensor = np.load('demand_tensor.npy')
+# 这里你用自己预测模型的 test 部分的某一段，作为确定性需求输入
+# 假设你取某个工作日 16 个时间步（8小时）
+
+# 构造距离矩阵（用之前 station_df）
+coords = station_df[station_df['station_id'].isin(stations_20)]
+# ... 计算 20x20 距离矩阵，保存为 distance_matrix.npy
