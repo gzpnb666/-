@@ -4,3 +4,25 @@ time_end   = '2023-12-31 23:30:00'
 修改为：
 time_start = demand['time_bin'].min()
 time_end   = demand['time_bin'].max()
+
+时空预测的18-30：
+time_start = '2020-07-01 00:00:00'
+time_end = '2023-12-31 23:30:00'
+all_times = pd.date_range(time_start, time_end, freq='30min')
+print(f"时间步总数: {len(all_times)}")
+
+# ========== 3. 过滤虚拟站点，仅保留真实物理站点 ==========
+stations = demand['station_id'].unique()
+virtual_stations = [s for s in stations if str(s).startswith('V_')]
+print(f"原始站点总数: {len(stations)}")
+print(f"其中虚拟站点(V_)数量: {len(virtual_stations)}")
+
+real_stations = [s for s in stations if not str(s).startswith('V_')]
+demand = demand[demand['station_id'].isin(real_stations)]
+修改为：
+# 方法1：动态使用数据实际时间范围
+time_start = demand['time_bin'].min()
+time_end   = demand['time_bin'].max()
+all_times  = pd.date_range(time_start, time_end, freq='30min')
+# 同时删除或注释掉下面这行过滤（因为已经用实际范围构建了 all_times）
+# demand = demand[(demand['time_bin'] >= time_start) & (demand['time_bin'] <= time_end)]
